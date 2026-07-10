@@ -1,0 +1,69 @@
+name: sync-upstream
+
+# Keeps this fork's main up to date with the upstream repo, then triggers the
+# image build. Runs on a schedule and on demand. This is the reliable path for
+# "Sync fork → new image", because a plain Sync-fork merge commit does not fire
+# workflow events on a fork.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build image even if already up to date"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM: router-for-me/CLIProxyAPI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream main
+          before="$(git rev-parse HEAD)"
+          # Merge upstream; our fork commits stay on top. Conflicts abort the run
+          # so they can be resolved by hand (rare — our changes are additive).
+          if git merge --no-edit upstream/main; then
+            after="$(git rev-parse HEAD)"
+            if [ "$before" != "$after" ]; then
+              git push origin main
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "Merged upstream: $before -> $after"
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "Already up to date."
+            fi
+          else
+            echo "::error::Merge conflict with upstream — resolve manually."
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Trigger image build
+        if: steps.merge.outputs.changed == 'true' || inputs.force_build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Target this fork explicitly — a leftover `upstream` remote would
+          # otherwise make gh resolve the wrong repository.
+          gh workflow run docker-image.yml --repo "${GITHUB_REPOSITORY}" --ref main
+          echo "Dispatched docker-image build for ${GITHUB_REPOSITORY}."

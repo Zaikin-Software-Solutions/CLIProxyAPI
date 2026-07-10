@@ -532,6 +532,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		v1.GET("/codex/limits", s.codexLimitsHandler)
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
@@ -569,6 +570,7 @@ func (s *Server) setupRoutes() {
 				"POST /v1/chat/completions",
 				"POST /v1/completions",
 				"GET /v1/models",
+				"GET /v1/codex/limits",
 			},
 		})
 	})
