@@ -129,6 +129,7 @@ func TestAPIKeyModelAlias_MultipleProviders(t *testing.T) {
 		GeminiKey: []internalconfig.GeminiKey{{APIKey: "gemini-key", Models: []internalconfig.GeminiModel{{Name: "gemini-2.5-pro", Alias: "gp"}}}},
 		ClaudeKey: []internalconfig.ClaudeKey{{APIKey: "claude-key", Models: []internalconfig.ClaudeModel{{Name: "claude-sonnet-4", Alias: "cs4"}}}},
 		CodexKey:  []internalconfig.CodexKey{{APIKey: "codex-key", Models: []internalconfig.CodexModel{{Name: "o3", Alias: "o"}}}},
+		XAIKey:    []internalconfig.XAIKey{{APIKey: "xai-key", Models: []internalconfig.XAIModel{{Name: "grok-4.5", Alias: "grok-latest"}}}},
 	}
 
 	mgr := NewManager(nil, nil, nil)
@@ -138,6 +139,7 @@ func TestAPIKeyModelAlias_MultipleProviders(t *testing.T) {
 	_, _ = mgr.Register(ctx, &Auth{ID: "gemini-auth", Provider: "gemini", Attributes: map[string]string{"api_key": "gemini-key"}})
 	_, _ = mgr.Register(ctx, &Auth{ID: "claude-auth", Provider: "claude", Attributes: map[string]string{"api_key": "claude-key"}})
 	_, _ = mgr.Register(ctx, &Auth{ID: "codex-auth", Provider: "codex", Attributes: map[string]string{"api_key": "codex-key"}})
+	_, _ = mgr.Register(ctx, &Auth{ID: "xai-auth", Provider: "xai", Attributes: map[string]string{"api_key": "xai-key"}})
 
 	tests := []struct {
 		authID, input, want string
@@ -145,6 +147,7 @@ func TestAPIKeyModelAlias_MultipleProviders(t *testing.T) {
 		{"gemini-auth", "gp", "gemini-2.5-pro"},
 		{"claude-auth", "cs4", "claude-sonnet-4"},
 		{"codex-auth", "o", "o3"},
+		{"xai-auth", "grok-latest", "grok-4.5"},
 	}
 
 	for _, tt := range tests {
@@ -286,5 +289,71 @@ func TestResolveAPIKeyModelAliasWithResult_ForceMappingUsesConfigAliasNotRequest
 	}
 	if result.OriginalAlias != "claude-sonnet-4-5" {
 		t.Fatalf("OriginalAlias = %q want claude-sonnet-4-5", result.OriginalAlias)
+	}
+}
+
+func TestLookupAPIKeyUpstreamModel_MetaKey(t *testing.T) {
+	cfg := &internalconfig.Config{
+		MetaKey: []internalconfig.MetaKey{
+			{
+				APIKey:  "meta-key",
+				BaseURL: "https://api.meta.ai/v1",
+				Models: []internalconfig.CodexModel{
+					{Name: "muse-spark-1.3", Alias: "muse-latest"},
+				},
+			},
+		},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(cfg)
+
+	ctx := context.Background()
+	auth := &Auth{
+		ID:       "meta-auth-1",
+		Provider: "meta",
+		Attributes: map[string]string{
+			"api_key":   "meta-key",
+			"base_url":  "https://api.meta.ai/v1",
+			"auth_kind": "apikey",
+		},
+	}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	// 1. Fast path: lookup per-auth mapping table compiled during register.
+	resolved := mgr.lookupAPIKeyUpstreamModel("meta-auth-1", "muse-latest")
+	if resolved != "muse-spark-1.3" {
+		t.Fatalf("lookupAPIKeyUpstreamModel() = %q, want muse-spark-1.3", resolved)
+	}
+
+	// 2. Slow path: directly call mgr.applyAPIKeyModelAliasWithRouting with an empty alias table to exercise config resolution fallback.
+	slowRouting := &apiKeyModelRoutingSnapshot{
+		config:  cfg,
+		aliases: make(apiKeyModelAliasTable),
+	}
+	slowResolved := mgr.applyAPIKeyModelAliasWithRouting(slowRouting, auth, "muse-latest")
+	if slowResolved != "muse-spark-1.3" {
+		t.Fatalf("applyAPIKeyModelAliasWithRouting(slow) = %q, want muse-spark-1.3", slowResolved)
+	}
+
+	// 3. Model alias result with force mapping / alias metadata
+	aliasResult := mgr.resolveAPIKeyModelAliasWithResult(auth, "muse-latest")
+	if aliasResult.UpstreamModel != "muse-spark-1.3" {
+		t.Fatalf("resolveAPIKeyModelAliasWithResult() upstream = %q, want muse-spark-1.3", aliasResult.UpstreamModel)
+	}
+
+	// 4. Configured alias entries helper
+	entries := configuredModelAliasEntries(cfg, auth)
+	found := false
+	for _, e := range entries {
+		if e.GetAlias() == "muse-latest" && e.GetName() == "muse-spark-1.3" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("configuredModelAliasEntries did not contain muse-latest -> muse-spark-1.3: %+v", entries)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -69,7 +71,37 @@ func shouldEnableExampleAPIKeySafeMode(cfg *config.Config, commandMode, tuiMode,
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
-	fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	if len(os.Args) > 1 && os.Args[1] == "discover" {
+		discoverFlags := flag.NewFlagSet("discover", flag.ExitOnError)
+		timeoutSec := discoverFlags.Int("timeout", 3, "Discovery timeout in seconds")
+		jsonOut := discoverFlags.Bool("json", false, "Output in JSON format")
+		serviceType := discoverFlags.String("service-type", "", "DNS-SD service type (default _ai-gateway._tcp)")
+		configPathFlag := discoverFlags.String("config", DefaultConfigPath, "Configure File Path")
+		var include, exclude []string
+		discoverFlags.Func("include", "Comma-separated interface names to scan (overrides default physical LAN filter)", appendCSV(&include))
+		discoverFlags.Func("exclude", "Comma-separated interface names to skip", appendCSV(&exclude))
+		_ = discoverFlags.Parse(os.Args[2:])
+		if !*jsonOut {
+			fmt.Fprintf(os.Stderr, "CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+		}
+		cfgInclude, cfgExclude := cmd.LoadDiscoveryScanFilters(*configPathFlag)
+		include, exclude = cmd.ResolveDiscoveryInterfaceFilters(include, exclude, cfgInclude, cfgExclude)
+		code := cmd.DoDiscoverWithOptions(cmd.DiscoverOptions{
+			Timeout:     time.Duration(*timeoutSec) * time.Second,
+			JSONOutput:  *jsonOut,
+			ServiceType: *serviceType,
+			Include:     include,
+			Exclude:     exclude,
+		})
+		os.Exit(code)
+	}
+
+	// For legacy --discover-json flag or JSON requests, keep stdout clean
+	isJSONDiscover := argvEnablesBoolFlag(os.Args[1:], "discover-json")
+	isDiscoverMode := isJSONDiscover || argvEnablesBoolFlag(os.Args[1:], "discover")
+	if !isJSONDiscover {
+		fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	}
 
 	// Command-line flags to control the application's behavior.
 	var codexLogin bool
@@ -79,7 +111,16 @@ func main() {
 	var oauthCallbackPort int
 	var antigravityLogin bool
 	var kimiLogin bool
+	var kimiAILogin bool
 	var xaiLogin bool
+	var devinLogin bool
+	var metaLogin bool
+	var discoverGateways bool
+	var discoverTimeout int
+	var discoverJSON bool
+	var discoverServiceType string
+	var discoverInclude []string
+	var discoverExclude []string
 	var vertexImport string
 	var vertexImportPrefix string
 	var configPath string
@@ -97,8 +138,17 @@ func main() {
 	flag.BoolVar(&noBrowser, "no-browser", false, "Don't open browser automatically for OAuth")
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
-	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
+	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi (.com) using OAuth")
+	flag.BoolVar(&kimiAILogin, "kimi-ai-login", false, "Login to Kimi.ai using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
+	flag.BoolVar(&devinLogin, "devin-login", false, "Login to Devin using OAuth")
+	flag.BoolVar(&metaLogin, "meta-login", false, "Login to Meta using OAuth")
+	flag.BoolVar(&discoverGateways, "discover", false, "Discover local AI gateways and CPA instances on the LAN")
+	flag.IntVar(&discoverTimeout, "discover-timeout", 3, "Timeout in seconds for LAN discovery (default 3s)")
+	flag.BoolVar(&discoverJSON, "discover-json", false, "Output discovered gateways in JSON format")
+	flag.StringVar(&discoverServiceType, "discover-service-type", "", "DNS-SD service type for LAN discovery (default _ai-gateway._tcp)")
+	flag.Func("discover-include", "Comma-separated interface names to scan during LAN discovery", appendCSV(&discoverInclude))
+	flag.Func("discover-exclude", "Comma-separated interface names to skip during LAN discovery", appendCSV(&discoverExclude))
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
@@ -107,7 +157,7 @@ func main() {
 	flag.BoolVar(&homeDisableClusterDiscovery, "home-disable-cluster-discovery", false, "Disable Home CLUSTER NODES discovery and keep using the configured -home-jwt address")
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
-	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&localModel, "local-model", false, "Use embedded models.json and codex_client_models.json only, skip remote model catalog fetching")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -137,13 +187,28 @@ func main() {
 	}
 
 	pluginHost := pluginhost.New()
-	if bootstrapCfg := loadPluginBootstrapConfig(pluginBootstrapConfigPath(os.Args[1:], DefaultConfigPath)); bootstrapCfg != nil {
-		pluginHost.ApplyConfig(context.Background(), bootstrapCfg)
-		pluginHost.RegisterCommandLineFlags(context.Background(), flag.CommandLine)
+	if !isDiscoverMode {
+		if bootstrapCfg := loadPluginBootstrapConfig(pluginBootstrapConfigPath(os.Args[1:], DefaultConfigPath)); bootstrapCfg != nil {
+			pluginHost.ApplyConfig(context.Background(), bootstrapCfg)
+			pluginHost.RegisterCommandLineFlags(context.Background(), flag.CommandLine)
+		}
 	}
 
 	// Parse the command-line flags.
 	flag.Parse()
+
+	if discoverGateways || discoverJSON {
+		cfgInclude, cfgExclude := cmd.LoadDiscoveryScanFilters(configPath)
+		include, exclude := cmd.ResolveDiscoveryInterfaceFilters(discoverInclude, discoverExclude, cfgInclude, cfgExclude)
+		code := cmd.DoDiscoverWithOptions(cmd.DiscoverOptions{
+			Timeout:     time.Duration(discoverTimeout) * time.Second,
+			JSONOutput:  discoverJSON,
+			ServiceType: discoverServiceType,
+			Include:     include,
+			Exclude:     exclude,
+		})
+		os.Exit(code)
+	}
 
 	// Core application variables.
 	var err error
@@ -152,6 +217,7 @@ func main() {
 	var configLoadedFromHome bool
 	var homeClient *home.Client
 	var homePluginSyncReport homeplugins.SyncReport
+	var homePluginStatusReady bool
 	var (
 		usePostgresStore     bool
 		pgStoreDSN           string
@@ -282,7 +348,11 @@ func main() {
 			homeCfg.DisableClusterDiscovery = true
 		}
 		homeClient = home.New(homeCfg)
-		defer homeClient.Close()
+		defer func() {
+			if homeClient != nil {
+				homeClient.Close()
+			}
+		}()
 
 		ctxHomeConfig, cancelHomeConfig := context.WithTimeout(context.Background(), 30*time.Second)
 		raw, errGetConfig := homeClient.GetConfig(ctxHomeConfig)
@@ -301,18 +371,55 @@ func main() {
 			parsed = &config.Config{}
 		}
 		parsed.Home = homeCfg
-		parsed.Port = 8317 // Default to 8317 for home mode, can be overridden by home config
+		parsed.Port = config.NormalizeHomePort(parsed.Port)
 		parsed.UsageStatisticsEnabled = true
-		ctxHomePlugins, cancelHomePlugins := context.WithTimeout(context.Background(), 30*time.Second)
+		pluginSyncCfg := *parsed
+		parsed.Plugins.StoreAuth = nil
 		var errHomePlugins error
-		homePluginSyncReport, errHomePlugins = homeplugins.SyncWithReport(ctxHomePlugins, parsed, pluginHost)
-		cancelHomePlugins()
-		errReportPlugins := home.ReportPluginStatus(context.Background(), homeClient, homeCfg.NodeID, homePluginSyncReport)
-		if errHomePlugins != nil {
-			log.Errorf("failed to fetch plugins from home: %v", errHomePlugins)
+		platform := homeplugins.CurrentPlatform()
+		if pluginSyncCfg.Plugins.Enabled {
+			ctxHomePlugins, cancelHomePlugins := context.WithTimeout(context.Background(), 30*time.Second)
+			installedVersions, errInstalledPlugins := homeplugins.InstalledVersions(&pluginSyncCfg)
+			if errInstalledPlugins != nil {
+				homePluginStatusReady = true
+				errHomePlugins = errInstalledPlugins
+				homePluginSyncReport = homeplugins.CompletedSyncReport(platform, errInstalledPlugins)
+			} else {
+				pluginSyncRequest := sdkpluginstore.PluginSyncRequest{
+					SchemaVersion:     sdkpluginstore.PluginSyncSchemaVersion,
+					GOOS:              platform.GOOS,
+					GOARCH:            platform.GOARCH,
+					InstalledVersions: installedVersions,
+				}
+				pluginSyncResponse, errFetchPlugins := homeClient.GetPluginSync(ctxHomePlugins, pluginSyncRequest)
+				errHomePlugins = errFetchPlugins
+				switch {
+				case errHomePlugins == nil:
+					homePluginStatusReady = true
+					homePluginSyncReport, errHomePlugins = homeplugins.SyncResolvedWithReport(ctxHomePlugins, &pluginSyncCfg, pluginSyncResponse.Items, pluginSyncResponse.ExpiresAt, pluginSyncRequest.InstalledVersions, pluginHost)
+				case errors.Is(errHomePlugins, home.ErrPluginSyncUnsupported):
+					homePluginStatusReady = true
+					homePluginSyncReport, errHomePlugins = homeplugins.SyncWithReport(ctxHomePlugins, &pluginSyncCfg, pluginHost)
+				default:
+					homePluginStatusReady = true
+					homePluginSyncReport = homeplugins.CompletedSyncReport(platform, errHomePlugins)
+				}
+				pluginSyncRequest.Clear()
+				pluginSyncResponse.Clear()
+			}
+			cancelHomePlugins()
+		} else {
+			homePluginStatusReady = true
+			homePluginSyncReport = homeplugins.CompletedSyncReport(platform, nil)
 		}
-		if errReportPlugins != nil {
-			log.Warnf("failed to report home plugin sync status: %v", errReportPlugins)
+		if errHomePlugins != nil {
+			log.Errorf("failed to sync plugins from home: %v", errHomePlugins)
+		}
+		if homePluginStatusReady {
+			errReportPlugins := home.ReportPluginStatus(context.Background(), homeClient, homeCfg.NodeID, homePluginSyncReport)
+			if errReportPlugins != nil {
+				log.Warnf("failed to report home plugin sync status: %v", errReportPlugins)
+			}
 		}
 		if errHomePlugins != nil {
 			return
@@ -545,7 +652,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin
+	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || xaiLogin || devinLogin || metaLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
@@ -570,7 +677,7 @@ func main() {
 	// Register built-in access providers before constructing services.
 	configaccess.Register(&cfg.SDKConfig)
 	pluginHost.ApplyConfig(context.Background(), cfg)
-	if configLoadedFromHome {
+	if configLoadedFromHome && homePluginStatusReady {
 		errHomePluginLoad := homeplugins.MarkLoadResults(&homePluginSyncReport, pluginHost)
 		errReportPlugins := home.ReportPluginStatus(context.Background(), homeClient, cfg.Home.NodeID, homePluginSyncReport)
 		if errHomePluginLoad != nil {
@@ -582,6 +689,12 @@ func main() {
 		if errHomePluginLoad != nil {
 			return
 		}
+	}
+	if homeClient != nil {
+		// The bootstrap client is not owned by the runtime service. Close it after
+		// the final startup report so it cannot retain an idle RESP connection.
+		homeClient.Close()
+		homeClient = nil
 	}
 	if pluginHost.HasTriggeredCommandLineFlags() {
 		if exitCode, handled := pluginHost.ExecuteCommandLine(context.Background(), os.Args[0], os.Args[1:], configFilePath, flag.CommandLine); handled {
@@ -611,8 +724,14 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if kimiAILogin {
+		cmd.DoKimiAILogin(cfg, options)
 	} else if xaiLogin {
 		cmd.DoXAILogin(cfg, options)
+	} else if devinLogin {
+		cmd.DoDevinLogin(cfg, options)
+	} else if metaLogin {
+		cmd.DoMetaLogin(cfg, options)
 	} else {
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {
@@ -621,18 +740,14 @@ func main() {
 			return
 		}
 		if localModel && (!tuiMode || standalone) {
-			log.Info("Local model mode: using embedded model catalog, remote model updates disabled")
+			log.Info("Local model mode: using embedded model catalogs, remote model updates disabled")
 		}
 		if tuiMode {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
 				misc.StartAntigravityVersionUpdater(context.Background())
-				if !localModel && !cfg.Home.Enabled {
-					registry.StartModelsUpdater(context.Background())
-				} else if cfg.Home.Enabled {
-					log.Info("Home mode: remote model updates disabled")
-				}
+				startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
 				hook := tui.NewLogHook(2000)
 				hook.SetFormatter(&logging.LogFormatter{})
 				log.AddHook(hook)
@@ -706,13 +821,34 @@ func main() {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
-			if !localModel && !cfg.Home.Enabled {
-				registry.StartModelsUpdater(context.Background())
-			} else if cfg.Home.Enabled {
-				log.Info("Home mode: remote model updates disabled")
-			}
+			startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
 			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost, serverOptions...)
 		}
+	}
+}
+
+// modelCatalogUpdaterPlan decides which remote model catalogs should refresh.
+// Codex client and Devin catalogs still refresh under Home mode because
+// template metadata and Devin models stay edge-local.
+func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCodexClient, startDevin bool) {
+	if localModel {
+		return false, false, false
+	}
+	return !homeEnabled, true, true
+}
+
+func startModelCatalogUpdaters(localModel, homeEnabled bool) {
+	startModels, startCodexClient, startDevin := modelCatalogUpdaterPlan(localModel, homeEnabled)
+	if startCodexClient {
+		registry.StartCodexClientModelsUpdater(context.Background())
+	}
+	if startDevin {
+		registry.StartDevinModelsUpdater(context.Background())
+	}
+	if startModels {
+		registry.StartModelsUpdater(context.Background())
+	} else if homeEnabled {
+		log.Info("Home mode: remote models.json updates disabled; Codex client model list follows Home model IDs")
 	}
 }
 
@@ -770,4 +906,60 @@ func loadPluginBootstrapConfig(path string) *config.Config {
 		return cfg
 	}
 	return cfg
+}
+
+func appendCSV(dst *[]string) func(string) error {
+	return func(raw string) error {
+		*dst = append(*dst, cmd.ParseInterfaceList(raw)...)
+		return nil
+	}
+}
+
+func argvEnablesBoolFlag(args []string, name string) bool {
+	enabled := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-" || !strings.HasPrefix(arg, "-") {
+			break
+		}
+		flagName, value, hasValue := splitArgvFlag(arg)
+		if flagName == name {
+			if !hasValue {
+				enabled = true
+			} else if parsed, errParse := strconv.ParseBool(value); errParse == nil {
+				enabled = parsed
+			}
+		}
+		if !hasValue && argvFlagConsumesValue(flagName) {
+			if i+1 < len(args) && args[i+1] != "--" {
+				i++
+			}
+		}
+	}
+	return enabled
+}
+
+func argvFlagConsumesValue(name string) bool {
+	switch name {
+	case "codex-login", "codex-device-login", "claude-login", "no-browser",
+		"antigravity-login", "kimi-login", "kimi-ai-login", "xai-login", "devin-login", "meta-login",
+		"discover", "discover-json", "home-disable-cluster-discovery",
+		"tui", "standalone", "local-model":
+		return false
+	default:
+		return name != ""
+	}
+}
+
+func splitArgvFlag(arg string) (name, value string, hasValue bool) {
+	if !strings.HasPrefix(arg, "-") {
+		return "", "", false
+	}
+	arg = strings.TrimPrefix(arg, "-")
+	arg = strings.TrimPrefix(arg, "-")
+	name, value, hasValue = strings.Cut(arg, "=")
+	return name, value, hasValue
 }

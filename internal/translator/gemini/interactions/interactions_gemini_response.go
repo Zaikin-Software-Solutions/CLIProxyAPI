@@ -222,7 +222,7 @@ func interactionsFunctionResponseStepToGeminiPart(step gjson.Result) []byte {
 	if id := firstNonEmptyInteractionString(step.Get("call_id").String(), step.Get("id").String()); id != "" {
 		part, _ = sjson.SetBytes(part, "functionResponse.id", id)
 	}
-	part = setInteractionsGeminiRawObject(part, "functionResponse.response", firstExistingInteractionResult(step, "result", "response"))
+	part = setInteractionsGeminiFunctionResponse(part, "functionResponse.response", firstExistingInteractionResult(step, "result", "response"))
 	return part
 }
 
@@ -231,10 +231,14 @@ func buildInteractionsGeminiChunk(st *interactionsToGeminiStreamState, modelName
 	if len(parts) == 0 && includeEmptyPart {
 		parts = append(parts, geminiTextPartJSON("", false))
 	}
+	validParts := make([][]byte, 0, len(parts))
 	for _, part := range parts {
 		if len(part) > 0 {
-			out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts.-1", part)
+			validParts = append(validParts, part)
 		}
+	}
+	if len(validParts) > 0 {
+		out = translatorcommon.SetRawArrayItems(out, "candidates.0.content.parts", validParts)
 	}
 	if finishReason != "" {
 		out, _ = sjson.SetBytes(out, "candidates.0.finishReason", finishReason)
@@ -337,6 +341,23 @@ func setInteractionsGeminiRawObject(out []byte, path string, value gjson.Result)
 	}
 	if value.Raw != "" {
 		out, _ = sjson.SetRawBytes(out, path, []byte(value.Raw))
+	}
+	return out
+}
+
+func setInteractionsGeminiFunctionResponse(out []byte, path string, value gjson.Result) []byte {
+	if !value.Exists() {
+		out, _ = sjson.SetRawBytes(out, path, []byte(`{}`))
+		return out
+	}
+	if value.Type == gjson.String {
+		raw := strings.TrimSpace(value.String())
+		if raw != "" && gjson.Valid(raw) {
+			return translatorcommon.SetGeminiFunctionResponseRaw(out, path, raw)
+		}
+	}
+	if value.Raw != "" {
+		return translatorcommon.SetGeminiFunctionResponseResult(out, path, value)
 	}
 	return out
 }

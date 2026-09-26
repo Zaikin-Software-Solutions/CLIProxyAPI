@@ -41,49 +41,23 @@ func TestIsClaudeThinkingModel(t *testing.T) {
 	}
 }
 
-func TestEnsureClaudeModelIDPrefix(t *testing.T) {
+func TestIsClaudeModel(t *testing.T) {
 	tests := []struct {
-		name string
-		id   string
-		want string
+		name     string
+		model    string
+		expected bool
 	}{
-		{"empty", "", ""},
-		{"already has claude prefix", "claude-sonnet-4-6", "claude-sonnet-4-6"},
-		{"contains claude mid-string is reversed", "my-claude-custom", "claude-fable-5-dd-motsuc-edualc-ym"},
-		{"uppercase Claude prefix is reversed", "Claude-Opus-4", "claude-fable-5-dd-4-supO-edualC"},
-		{"gpt model is reversed", "gpt-4o", "claude-fable-5-dd-o4-tpg"},
-		{"gemini model is reversed", "gemini-2.5-pro", "claude-fable-5-dd-orp-5.2-inimeg"},
+		{"Claude model", "claude-sonnet-4-6", true},
+		{"Claude thinking model", "claude-opus-4-6-thinking", true},
+		{"case insensitive", "Claude-Sonnet-4-5", true},
+		{"Gemini model", "gemini-3-pro-preview", false},
+		{"empty string", "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := EnsureClaudeModelIDPrefix(tt.id); got != tt.want {
-				t.Fatalf("EnsureClaudeModelIDPrefix(%q) = %q, want %q", tt.id, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveClaudeModelIDPrefix(t *testing.T) {
-	tests := []struct {
-		name string
-		id   string
-		want string
-	}{
-		{"empty", "", ""},
-		{"plain claude id unchanged", "claude-sonnet-4-6", "claude-sonnet-4-6"},
-		{"non encoded id unchanged", "gpt-4o", "gpt-4o"},
-		{"encoded gpt model", "claude-fable-5-dd-o4-tpg", "gpt-4o"},
-		{"encoded gemini model", "claude-fable-5-dd-orp-5.2-inimeg", "gemini-2.5-pro"},
-		{"empty encoded body unchanged", "claude-fable-5-dd-", "claude-fable-5-dd-"},
-		{"preserves thinking suffix", "claude-fable-5-dd-o4-tpg(high)", "gpt-4o(high)"},
-		{"round trip", EnsureClaudeModelIDPrefix("custom-model-x"), "custom-model-x"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ResolveClaudeModelIDPrefix(tt.id); got != tt.want {
-				t.Fatalf("ResolveClaudeModelIDPrefix(%q) = %q, want %q", tt.id, got, tt.want)
+			if got := IsClaudeModel(tt.model); got != tt.expected {
+				t.Errorf("IsClaudeModel(%q) = %v, expected %v", tt.model, got, tt.expected)
 			}
 		})
 	}

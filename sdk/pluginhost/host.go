@@ -79,10 +79,15 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg RuntimeConfig) {
 
 // ShutdownAll unloads every active plugin.
 func (h *Host) ShutdownAll() {
+	h.ShutdownAllContext(context.Background())
+}
+
+// ShutdownAllContext detaches every active plugin and bounds waiting for active calls by ctx.
+func (h *Host) ShutdownAllContext(ctx context.Context) {
 	if h == nil || h.inner == nil {
 		return
 	}
-	h.inner.ShutdownAll()
+	h.inner.ShutdownAllContext(ctx)
 }
 
 // PluginBusy reports whether a plugin dynamic library is loaded or being loaded.
@@ -92,10 +97,15 @@ func (h *Host) PluginBusy(id string) bool {
 
 // UnloadPlugin removes one plugin from the active runtime and closes its dynamic library.
 func (h *Host) UnloadPlugin(id string) bool {
+	return h.UnloadPluginContext(context.Background(), id)
+}
+
+// UnloadPluginContext detaches one plugin and bounds waiting for active calls by ctx.
+func (h *Host) UnloadPluginContext(ctx context.Context, id string) bool {
 	if h == nil || h.inner == nil {
 		return false
 	}
-	return h.inner.UnloadPlugin(id)
+	return h.inner.UnloadPluginContext(ctx, id)
 }
 
 // ParseAuth lets plugin auth providers parse a credential payload.
@@ -151,11 +161,11 @@ func (h *Host) HasAuthProvider(provider string) bool {
 }
 
 // StartLogin starts a provider login flow through an active auth-provider plugin.
-func (h *Host) StartLogin(ctx context.Context, provider string, baseURL string) (pluginapi.AuthLoginStartResponse, bool, error) {
+func (h *Host) StartLogin(ctx context.Context, provider string, baseURL string, metadata ...map[string]any) (pluginapi.AuthLoginStartResponse, bool, error) {
 	if h == nil || h.inner == nil {
 		return pluginapi.AuthLoginStartResponse{}, false, nil
 	}
-	return h.inner.StartLogin(ctx, provider, baseURL)
+	return h.inner.StartLogin(ctx, provider, baseURL, metadata...)
 }
 
 // PollLogin polls a provider login flow through an active auth-provider plugin.
@@ -185,6 +195,12 @@ func (h *Host) PickAuth(ctx context.Context, req pluginapi.SchedulerPickRequest)
 // HasScheduler reports whether any active plugin provides a scheduler.
 func (h *Host) HasScheduler() bool {
 	return h != nil && h.inner != nil && h.inner.HasScheduler()
+}
+
+// SchedulerWantsAcrossPriorities reports whether the active scheduler opted into receiving
+// candidates across all priority tiers.
+func (h *Host) SchedulerWantsAcrossPriorities() bool {
+	return h != nil && h.inner != nil && h.inner.SchedulerWantsAcrossPriorities()
 }
 
 // RegisteredPlugins returns active plugin metadata from the current runtime snapshot.

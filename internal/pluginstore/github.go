@@ -3,11 +3,13 @@ package pluginstore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
@@ -20,10 +22,16 @@ const maxPluginStoreRedirects = 10
 type HTTPDoer = httpfetch.Doer
 
 type Client struct {
-	HTTPClient  HTTPDoer
-	RegistryURL string
-	UserAgent   string
-	Auth        []AuthConfig
+	HTTPClient HTTPDoer
+	// NetworkScope distinguishes request state for different proxy/egress configurations.
+	NetworkScope          string
+	RateLimiter           *GitHubRateLimiter
+	RegistryURL           string
+	UserAgent             string
+	Auth                  []AuthConfig
+	ResolvedAuth          []ResolvedAuthConfig
+	ResolvedAuthExpiresAt time.Time
+	preparedAuth          *preparedPluginStoreAuth
 }
 
 type Release struct {
@@ -132,27 +140,47 @@ func (c Client) releaseAssetAPIAuthenticated(apiURL string) bool {
 	if apiURL == "" {
 		return false
 	}
+	if item, ok := matchingResolvedAuthConfig(c.ResolvedAuth, apiURL, RequestKindArtifact); ok {
+		return resolvedAuthConfigured(item)
+	}
 	return AuthConfigured(c.Auth, apiURL, RequestKindArtifact)
 }
 
 func (c Client) get(ctx context.Context, requestURL string, accept string, kind string, maxSize int64) ([]byte, error) {
 	currentURL := strings.TrimSpace(requestURL)
+	limiter := c.githubRateLimiter()
 	for redirects := 0; ; redirects++ {
-		if errURL := validatePluginStoreRequestURL(c.Auth, currentURL, kind); errURL != nil {
-			return nil, errURL
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
 		}
-		headers := http.Header{
-			"Accept":     []string{accept},
-			"User-Agent": []string{c.userAgent()},
-		}
-		if errAuth := applyPluginStoreAuth(headers, c.Auth, currentURL, kind); errAuth != nil {
+		headers, authenticated, errAuth := c.authHeaders(currentURL, kind)
+		if errAuth != nil {
 			return nil, errAuth
 		}
+		rateKey := githubRateLimitKey(currentURL, c.NetworkScope, headers, authenticated)
+		if errLimit := limiter.check(rateKey); errLimit != nil {
+			return nil, errLimit
+		}
+		if headers.Get("Accept") == "" {
+			headers.Set("Accept", accept)
+		}
+		if headers.Get("User-Agent") == "" {
+			headers.Set("User-Agent", c.userAgent())
+		}
 		resp, errDo := pluginStoreGetNoRedirect(ctx, c.httpClient(), currentURL, headers)
+		if authenticated {
+			for name := range headers {
+				headers.Del(name)
+			}
+			if resp != nil && resp.Request != nil {
+				resp.Request.Header = nil
+			}
+		}
 		if errDo != nil {
 			return nil, errDo
 		}
 		if pluginStoreRedirectStatus(resp.StatusCode) {
+			_ = limiter.observe(rateKey, resp.StatusCode, resp.Header, nil)
 			nextURL, errRedirect := pluginStoreRedirectURL(resp, currentURL)
 			if errClose := resp.Body.Close(); errClose != nil {
 				log.WithError(errClose).Debug("failed to close plugin store redirect body")
@@ -166,7 +194,7 @@ func (c Client) get(ctx context.Context, requestURL string, accept string, kind 
 			currentURL = nextURL
 			continue
 		}
-		return readPluginStoreResponse(resp, maxSize)
+		return readPluginStoreResponse(resp, maxSize, authenticated, limiter, rateKey)
 	}
 }
 
@@ -195,7 +223,7 @@ func pluginStoreGetNoRedirect(ctx context.Context, client HTTPDoer, requestURL s
 	req.Header = headers.Clone()
 	resp, errDo := pluginStoreNoRedirectClient(client).Do(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("request failed: %w", errDo)
+		return nil, pluginStoreRequestError(requestURL, errDo)
 	}
 	return resp, nil
 }
@@ -240,16 +268,30 @@ func pluginStoreRedirectURL(resp *http.Response, requestURL string) (string, err
 	return next.String(), nil
 }
 
-func readPluginStoreResponse(resp *http.Response, maxSize int64) ([]byte, error) {
+func readPluginStoreResponse(resp *http.Response, maxSize int64, authenticated bool, limiter *GitHubRateLimiter, rateKey string) ([]byte, error) {
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.WithError(errClose).Debug("failed to close plugin store response body")
 		}
 	}()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		// Apply header-based limits before reading a potentially slow body.
+		if errLimit := limiter.observe(rateKey, resp.StatusCode, resp.Header, nil); errLimit != nil {
+			return nil, errLimit
+		}
+		if authenticated && (rateKey == "" || resp.StatusCode != http.StatusForbidden) {
+			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if errLimit := limiter.observe(rateKey, resp.StatusCode, resp.Header, body); errLimit != nil {
+			return nil, errLimit
+		}
+		if authenticated {
+			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+		}
 		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	_ = limiter.observe(rateKey, resp.StatusCode, resp.Header, nil)
 	reader := io.Reader(resp.Body)
 	if maxSize > 0 {
 		reader = io.LimitReader(resp.Body, maxSize+1)
@@ -262,6 +304,23 @@ func readPluginStoreResponse(resp *http.Response, maxSize int64) ([]byte, error)
 		return nil, fmt.Errorf("response exceeds maximum allowed size of %d bytes", maxSize)
 	}
 	return data, nil
+}
+
+func pluginStoreRequestError(requestURL string, err error) error {
+	parsed, errParse := url.Parse(strings.TrimSpace(requestURL))
+	safeURL := "plugin store url"
+	if errParse == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.ForceQuery = false
+		parsed.Fragment = ""
+		safeURL = parsed.String()
+	}
+	var urlError *url.Error
+	if errors.As(err, &urlError) && urlError.Err != nil {
+		err = urlError.Err
+	}
+	return fmt.Errorf("request %s failed: %w", safeURL, err)
 }
 
 func SelectReleaseAssets(release Release, id, version, goos, goarch string) (ReleaseAsset, ReleaseAsset, error) {

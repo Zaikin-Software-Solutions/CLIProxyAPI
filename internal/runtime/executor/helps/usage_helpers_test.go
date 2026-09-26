@@ -2,26 +2,37 @@ package helps
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/codex"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
-	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
+	data := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
 	detail := ParseOpenAIUsage(data)
-	if detail.InputTokens != 1 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 1)
+	if detail.InputTokens != 10 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
 	}
-	if detail.OutputTokens != 2 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 2)
+	if detail.OutputTokens != 6 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 6)
 	}
-	if detail.TotalTokens != 3 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 3)
+	if detail.TotalTokens != 16 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 16)
 	}
 	if detail.CachedTokens != 4 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 4)
@@ -31,6 +42,12 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.Output.NonReasoningTokens != 1 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
@@ -57,6 +74,32 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ResponseServiceTier != "default" {
 		t.Fatalf("response service tier = %q, want default", detail.ResponseServiceTier)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 3 || detail.TokenBreakdown.Output.NonReasoningTokens != 11 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageTotalOnlyIsUnclassified(t *testing.T) {
+	detail := ParseOpenAIUsage([]byte(`{"usage":{"total_tokens":42}}`))
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityUnclassified ||
+		detail.TotalTokens != 42 || detail.TokenBreakdown.UnclassifiedTokens != 42 {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsagePartialBucketsPreserveKnownTokens(t *testing.T) {
+	detail := ParseOpenAIUsage([]byte(`{"usage":{"input_tokens":10,"total_tokens":15}}`))
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityUnclassified ||
+		detail.TokenBreakdown.Input.TotalTokens != 10 || detail.TokenBreakdown.UnclassifiedTokens != 5 {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsageExplicitZeroBucketsRemainInconsistent(t *testing.T) {
+	detail := ParseOpenAIUsage([]byte(`{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":42}}`))
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityInconsistent {
+		t.Fatalf("detail = %+v", detail)
 	}
 }
 
@@ -86,6 +129,9 @@ func TestParseCodexUsageIncludesCacheWriteTokens(t *testing.T) {
 	}
 	if detail.ResponseServiceTier != "priority" {
 		t.Fatalf("response service tier = %q, want priority", detail.ResponseServiceTier)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 30 || detail.TokenBreakdown.Input.CacheWriteTokens != 40 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
@@ -283,6 +329,9 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	if detail.TotalTokens != 22859 {
 		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22859)
 	}
+	if detail.TokenBreakdown.Input.TotalTokens != 22606 || detail.TokenBreakdown.Input.UncachedTokens != 3085 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
 }
 
 func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
@@ -296,6 +345,72 @@ func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsagePreservesThinkingTokensAsReasoningSubset(t *testing.T) {
+	// Sanitized shape from local Anthropic request logs under ~/.config/cpa/logs.
+	data := []byte(`{"usage":{"input_tokens":2,"cache_creation_input_tokens":831,"cache_read_input_tokens":44225,"output_tokens":244,"output_tokens_details":{"thinking_tokens":40}}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.OutputTokens != 244 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 244)
+	}
+	if detail.ReasoningTokens != 40 {
+		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 40)
+	}
+	if detail.TotalTokens != 45302 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 45302)
+	}
+	if !detail.TokenBreakdown.Valid() ||
+		detail.TokenBreakdown.Output.TotalTokens != 244 ||
+		detail.TokenBreakdown.Output.NonReasoningTokens != 204 ||
+		detail.TokenBreakdown.Output.ReasoningTokens != 40 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseClaudeStreamUsagePreservesThinkingTokensAsReasoningSubset(t *testing.T) {
+	line := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":831,"cache_read_input_tokens":44225,"output_tokens":244,"output_tokens_details":{"thinking_tokens":40}}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("expected stream usage to parse")
+	}
+	if detail.OutputTokens != 244 || detail.ReasoningTokens != 40 || detail.TotalTokens != 45302 {
+		t.Fatalf("stream usage detail = %+v", detail)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Output.NonReasoningTokens != 204 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseClaudeStreamUsage_MessageStart(t *testing.T) {
+	line := []byte(`data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"claude-opus-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2095,"cache_creation_input_tokens":7185,"cache_read_input_tokens":355598,"output_tokens":1}}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("expected stream usage to parse from message_start")
+	}
+	if detail.InputTokens != 2095 {
+		t.Errorf("input tokens = %d, want 2095", detail.InputTokens)
+	}
+	if detail.CacheReadTokens != 355598 {
+		t.Errorf("cache read tokens = %d, want 355598", detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 7185 {
+		t.Errorf("cache creation tokens = %d, want 7185", detail.CacheCreationTokens)
+	}
+	if detail.CachedTokens != 355598 {
+		t.Errorf("cached tokens = %d, want 355598", detail.CachedTokens)
+	}
+}
+
+func TestParseClaudeUsageFallsBackToTopLevelThinkingTokens(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":3,"output_tokens":10,"thinking_tokens":4}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.OutputTokens != 10 || detail.ReasoningTokens != 4 || detail.TotalTokens != 13 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if detail.TokenBreakdown.Output.NonReasoningTokens != 6 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
 func TestParseGeminiUsageNormalizesCachedContent(t *testing.T) {
 	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"cachedContentTokenCount":4,"totalTokenCount":12}}`))
 	if detail.CachedTokens != 4 {
@@ -303,6 +418,59 @@ func TestParseGeminiUsageNormalizesCachedContent(t *testing.T) {
 	}
 	if detail.CacheReadTokens != 4 {
 		t.Fatalf("cache read tokens = %d, want 4", detail.CacheReadTokens)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.TotalTokens != 12 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseGeminiUsageIncludesToolUsePromptTokens(t *testing.T) {
+	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":3,"toolUsePromptTokenCount":5,"totalTokenCount":20}}`))
+	if detail.InputTokens != 15 || detail.TotalTokens != 20 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete ||
+		detail.TokenBreakdown.Input.UncachedTokens != 15 || detail.TokenBreakdown.Output.ReasoningTokens != 3 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseGeminiStreamUsageSkipsZeroPlaceholder(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`data: {"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"thoughtsTokenCount":0,"totalTokenCount":0}}`),
+		[]byte(`data: {"usageMetadata":{"promptTokenCount":17984,"candidatesTokenCount":2668,"thoughtsTokenCount":1028,"totalTokenCount":21680}}`),
+	}
+
+	accepted := make([]usage.Detail, 0, len(lines))
+	for _, line := range lines {
+		detail, ok := ParseGeminiStreamUsage(line)
+		if ok {
+			accepted = append(accepted, detail)
+		}
+	}
+
+	if len(accepted) != 1 {
+		t.Fatalf("accepted usage count = %d, want 1", len(accepted))
+	}
+	detail := accepted[0]
+	if detail.InputTokens != 17984 || detail.OutputTokens != 2668 || detail.ReasoningTokens != 1028 || detail.TotalTokens != 21680 {
+		t.Fatalf("accepted usage detail = %+v", detail)
+	}
+}
+
+func TestParseGeminiUsageRejectsInvalidToolUseSums(t *testing.T) {
+	tests := map[string]string{
+		"negative": `{"usageMetadata":{"promptTokenCount":10,"toolUsePromptTokenCount":-1,"totalTokenCount":10}}`,
+		"overflow": `{"usageMetadata":{"promptTokenCount":9223372036854775807,"toolUsePromptTokenCount":1,"totalTokenCount":9223372036854775807}}`,
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			detail := ParseGeminiUsage([]byte(payload))
+			if detail.InputTokens < 0 || !detail.TokenBreakdown.Valid() ||
+				detail.TokenBreakdown.Quality != usage.TokenAccountingQualityInconsistent {
+				t.Fatalf("detail = %+v", detail)
+			}
+		})
 	}
 }
 
@@ -326,12 +494,40 @@ func TestParseInteractionsUsage(t *testing.T) {
 	if detail.CacheReadTokens != 2 {
 		t.Fatalf("cache read tokens = %d, want 2", detail.CacheReadTokens)
 	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 1 || detail.TokenBreakdown.Output.TotalTokens != 9 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestNormalizeUsageDetailTotalDoesNotDoubleCountReasoning(t *testing.T) {
+	detail := normalizeUsageDetailTotal(usage.Detail{
+		InputTokens:     100,
+		OutputTokens:    30,
+		ReasoningTokens: 12,
+	}, "openai", "")
+	if detail.TotalTokens != 130 {
+		t.Fatalf("total tokens = %d, want 130", detail.TotalTokens)
+	}
+	if detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete || detail.TokenBreakdown.Output.ReasoningTokens != 12 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
 }
 
 func TestParseInteractionsUsageNormalizesCacheWriteAlias(t *testing.T) {
 	detail := ParseInteractionsUsage([]byte(`{"usage":{"input_tokens":3,"cache_write_tokens":2}}`))
 	if detail.CacheCreationTokens != 2 {
 		t.Fatalf("cache creation tokens = %d, want 2", detail.CacheCreationTokens)
+	}
+}
+
+func TestParseInteractionsUsageIncludesToolUseTokens(t *testing.T) {
+	detail := ParseInteractionsUsage([]byte(`{"usage":{"total_input_tokens":2,"total_output_tokens":6,"total_thought_tokens":3,"total_tool_use_tokens":4,"total_tokens":15}}`))
+	if detail.InputTokens != 6 || detail.OutputTokens != 6 || detail.ReasoningTokens != 3 || detail.TotalTokens != 15 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete ||
+		detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.Output.TotalTokens != 9 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
@@ -388,7 +584,8 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 
 func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	delay := 40 * time.Millisecond
-	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 	client := reporter.TrackHTTPClient(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			time.Sleep(delay)
@@ -402,7 +599,7 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 		}),
 	})
 
-	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/chat/completions", strings.NewReader("{}"))
+	req, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/v1/chat/completions", strings.NewReader("{}"))
 	if errNewRequest != nil {
 		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
 	}
@@ -418,6 +615,136 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	}
 	if got := reporter.ttftDuration(); got < delay {
 		t.Fatalf("ttft = %v, want >= %v", got, delay)
+	}
+	if !cliproxyexecutor.UpstreamAttempted(ctx) {
+		t.Fatal("HTTP RoundTrip did not mark an upstream attempt")
+	}
+}
+
+func TestUsageReporterTrackHTTPClientRoundTripOnly_DoesNotTriggerOnBodyRead(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	client := reporter.TrackHTTPClientRoundTripOnly(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			time.Sleep(10 * time.Millisecond)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\n")),
+				Request:    req,
+			}, nil
+		}),
+	})
+
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/responses", strings.NewReader("{}"))
+	if errNewRequest != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	bodyBytes, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close error = %v", errClose)
+	}
+
+	// 1. Plain body reading must NOT set TTFT
+	if reporter.IsTTFTSet() {
+		t.Fatalf("TrackHTTPClientRoundTripOnly must not set TTFT on plain body read")
+	}
+
+	// 2. Observing metadata event records fallback, but does NOT set effective TTFT
+	ObserveResponsesTokenEvent(reporter, bodyBytes)
+	if reporter.IsTTFTSet() {
+		t.Fatalf("Observing metadata event must not set effective TTFT")
+	}
+	if reporter.ttftDuration() <= 0 {
+		t.Fatalf("Fallback TTFT should be recorded and > 0, got %v", reporter.ttftDuration())
+	}
+
+	// 3. Observing substantive token event sets effective TTFT
+	ObserveResponsesTokenEvent(reporter, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
+	if !reporter.IsTTFTSet() {
+		t.Fatalf("Observing token event must set effective TTFT")
+	}
+}
+
+func TestUsageReporterTrackHTTPClientRoundTripOnly_ErrorResponseRecordsFirstPacketFallback(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	client := reporter.TrackHTTPClientRoundTripOnly(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"rate limit"}}`)),
+				Request:    req,
+			}, nil
+		}),
+	})
+
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/responses", strings.NewReader("{}"))
+	if errNewRequest != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	_, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	_ = resp.Body.Close()
+
+	if reporter.IsTTFTSet() {
+		t.Fatalf("error response read must not set substantive token TTFT")
+	}
+	if !reporter.IsFirstPacketSet() {
+		t.Fatalf("error response read must record first packet set fallback")
+	}
+}
+
+func TestUsageReporterObserveTokenEvent_FastPathNonTokenAndToken(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.6-luna", nil)
+	reporter.StartResponseTTFT()
+
+	// 1. Initial state
+	if reporter.IsTTFTSet() {
+		t.Fatalf("expected IsTTFTSet() == false initially")
+	}
+
+	// 2. First non-token event records firstPacketDuration, but does not mark TTFT set
+	reporter.ObserveTokenEvent(false)
+	if reporter.IsTTFTSet() {
+		t.Fatalf("ObserveTokenEvent(false) must not set TTFT")
+	}
+	if !reporter.IsFirstPacketSet() {
+		t.Fatalf("expected IsFirstPacketSet() == true")
+	}
+	firstPacketDuration := reporter.firstPacketDuration
+
+	// 3. Subsequent non-token event is a fast-path return and does not alter firstPacketDuration
+	reporter.ObserveTokenEvent(false)
+	if reporter.firstPacketDuration != firstPacketDuration {
+		t.Fatalf("subsequent ObserveTokenEvent(false) must preserve original firstPacketDuration")
+	}
+
+	// 4. Substantive token event sets effective TTFT
+	reporter.ObserveTokenEvent(true)
+	if !reporter.IsTTFTSet() {
+		t.Fatalf("ObserveTokenEvent(true) must set IsTTFTSet() == true")
+	}
+	tokenTTFT := reporter.ttft
+
+	// 5. Subsequent token event is a fast-path return and does not alter TTFT
+	reporter.ObserveTokenEvent(true)
+	if reporter.ttft != tokenTTFT {
+		t.Fatalf("subsequent ObserveTokenEvent(true) must not alter already recorded TTFT")
 	}
 }
 
@@ -457,41 +784,121 @@ func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
 }
 
 func TestUsageReporterBuildRecordIncludesServiceTier(t *testing.T) {
-	ctx := usage.WithServiceTier(context.Background(), "priority")
+	ctx := usage.WithServiceTier(context.Background(), "auto")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 
 	record := reporter.buildRecord(usage.Detail{TotalTokens: 3, ResponseServiceTier: "default"}, false)
-	if record.ServiceTier != "priority" {
-		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "priority")
-	}
-	if record.RequestServiceTier != "priority" {
-		t.Fatalf("request service tier = %q, want priority", record.RequestServiceTier)
+	if record.ServiceTier != "auto" {
+		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "auto")
 	}
 	if record.ResponseServiceTier != "default" {
 		t.Fatalf("response service tier = %q, want default", record.ResponseServiceTier)
 	}
 }
 
-func TestUsageReporterSetTranslatedReasoningEffortUpdatesServiceTier(t *testing.T) {
+func TestUsageReporterBuildRecordDefaultsGenerateTrue(t *testing.T) {
 	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if !usage.GenerateEnabled(record.Generate) {
+		t.Fatalf("generate = %v, want true", usage.GenerateEnabled(record.Generate))
+	}
+}
+
+func TestUsageReporterBuildRecordIncludesGenerateFalse(t *testing.T) {
+	ctx := usage.WithGenerate(context.Background(), false)
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if usage.GenerateEnabled(record.Generate) {
+		t.Fatalf("generate = %v, want false", usage.GenerateEnabled(record.Generate))
+	}
+}
+
+func TestUsageReporterBuildRecordDefaultsStreamFalse(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Stream {
+		t.Fatalf("stream = %v, want false", record.Stream)
+	}
+}
+
+func TestUsageReporterBuildRecordIncludesStreamTrue(t *testing.T) {
+	ctx := usage.WithStream(context.Background(), true)
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if !record.Stream {
+		t.Fatalf("stream = %v, want true", record.Stream)
+	}
+}
+
+func TestUsageReporterSetStream(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	reporter.SetStream(true)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if !record.Stream {
+		t.Fatalf("stream = %v, want true", record.Stream)
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortPreservesClientServiceTier(t *testing.T) {
+	ctx := usage.WithServiceTier(context.Background(), "auto")
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 
 	reporter.SetTranslatedReasoningEffort([]byte(`{"service_tier":"priority"}`), "openai")
 
 	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
-	if record.ServiceTier != "priority" {
-		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "priority")
+	if record.ServiceTier != "auto" {
+		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "auto")
 	}
 }
 
-func TestUsageReporterSetTranslatedReasoningEffortDefaultsServiceTierWhenRemoved(t *testing.T) {
-	ctx := usage.WithServiceTier(context.Background(), "priority")
-	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+func TestUsageReporterSetTranslatedReasoningEffortCodexConfigurationUpdate(t *testing.T) {
+	ctx := context.Background()
+	reporter := NewUsageReporter(ctx, "codex", "gpt-6-astra", nil)
 
-	reporter.SetTranslatedReasoningEffort([]byte(`{"model":"gpt-5.4"}`), "openai")
+	payload := []byte(`{"model":"gpt-6-astra","reasoning":{"effort":"xhigh"},"input":[{"type":"configuration_update","reasoning":{"effort":"low"}}]}`)
+	reporter.SetTranslatedReasoningEffort(payload, "codex")
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
-	if record.ServiceTier != usage.DefaultServiceTier {
-		t.Fatalf("service tier = %q, want %q", record.ServiceTier, usage.DefaultServiceTier)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false)
+	if record.ReasoningEffort != "low" {
+		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "low")
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortConfigurationUpdateAfterCleanup(t *testing.T) {
+	const source = `{"reasoning":{"effort":"xhigh"},"input":[{"type":"configuration_update","reasoning":{"effort":"medium"}},{"type":"configuration_update","reasoning":{"effort":"low"}},{"role":"user","content":"ok"}]}`
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		want      string
+	}{
+		{name: "supported target reports effective update", supported: true, want: "low"},
+		{name: "unsupported target reports cleaned suffix", want: "high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := "opaque-route(high)"
+			requestEffort := thinking.ExtractReasoningEffort([]byte(source), "openai-response", model)
+			if requestEffort != "low" {
+				t.Fatalf("request effort = %q, want low", requestEffort)
+			}
+			info := &registry.ModelInfo{
+				ID: "opaque-route", Type: "codex", SupportConfigurationUpdate: tc.supported,
+				Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+			}
+			body, err := thinking.ApplyThinkingWithModelInfoAndSummary([]byte(source), []byte(source), model, "openai-response", "codex", "codex", info, thinking.SummaryConfig{})
+			if err != nil {
+				t.Fatalf("ApplyThinkingWithModelInfoAndSummary() error = %v", err)
+			}
+			reporter := NewUsageReporter(usage.WithReasoningEffort(context.Background(), requestEffort), "codex", model, nil)
+			reporter.SetTranslatedReasoningEffort(body, "codex")
+			if got := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false).ReasoningEffort; got != tc.want {
+				t.Fatalf("final usage effort = %q, want %q; body=%s", got, tc.want, body)
+			}
+		})
 	}
 }
 
@@ -513,6 +920,169 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 }
 
+type usageResponseBodyError struct {
+	status  int
+	message string
+	body    []byte
+}
+
+func (e usageResponseBodyError) Error() string {
+	return e.message
+}
+
+func (e usageResponseBodyError) StatusCode() int {
+	return e.status
+}
+
+func (e usageResponseBodyError) ResponseBody() []byte {
+	return e.body
+}
+
+func TestFailFromErrorsPrefersResponseBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "original response body", body: []byte(" \n{\"error\":\"upstream rejected request\"}\r\n")},
+		{name: "empty response body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errExecute := fmt.Errorf("execute failed: %w", usageResponseBodyError{
+				status:  http.StatusUnauthorized,
+				message: "generic upstream error",
+				body:    tc.body,
+			})
+			failure := failFromErrors(errExecute)
+			wantBody := errExecute.Error()
+			if len(tc.body) > 0 {
+				wantBody = string(tc.body)
+			}
+			if failure.StatusCode != http.StatusUnauthorized || failure.Body != wantBody {
+				t.Fatalf("failure = %#v, want status %d body %q", failure, http.StatusUnauthorized, wantBody)
+			}
+		})
+	}
+}
+
+func TestFailFromErrorsMapsContextStatuses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "canceled", err: context.Canceled, want: clienterror.StatusClientClosedRequest},
+		{name: "deadline", err: context.DeadlineExceeded, want: http.StatusGatewayTimeout},
+		{
+			name: "url error wraps canceled",
+			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: context.Canceled},
+			want: clienterror.StatusClientClosedRequest,
+		},
+		{name: "plain error", err: errors.New("boom"), want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fail := failFromErrors(tc.err)
+			if fail.StatusCode != tc.want {
+				t.Fatalf("StatusCode = %d, want %d; body=%q", fail.StatusCode, tc.want, fail.Body)
+			}
+			if strings.TrimSpace(fail.Body) == "" {
+				t.Fatalf("expected non-empty failure body")
+			}
+		})
+	}
+
+	if fail := failFromErrors(nil, nil); fail.StatusCode != 0 || fail.Body != "" {
+		t.Fatalf("failFromErrors(nil) = %+v, want empty failure", fail)
+	}
+}
+
+func TestStreamUsageBufferPublishFailure(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.Observe(usage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}, true)
+
+	reporter := &UsageReporter{
+		provider: "openai",
+		model:    "gpt-5.4",
+	}
+
+	record := reporter.buildRecord(buffer.detail, true, failFromErrors(context.Canceled))
+	if !record.Failed {
+		t.Fatal("expected record to be marked failed")
+	}
+	if record.Fail.StatusCode != clienterror.StatusClientClosedRequest {
+		t.Fatalf("Fail.StatusCode = %d, want %d", record.Fail.StatusCode, clienterror.StatusClientClosedRequest)
+	}
+	if record.Detail.TotalTokens != 15 {
+		t.Fatalf("Detail.TotalTokens = %d, want 15", record.Detail.TotalTokens)
+	}
+}
+
+func TestStreamUsageBufferObserveClaudeStream_MergesStartAndDelta(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	lineStart := []byte(`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-opus-5","usage":{"input_tokens":2095,"cache_creation_input_tokens":7185,"cache_read_input_tokens":355598,"output_tokens":1}}}`)
+	buffer.ObserveClaudeStream(lineStart)
+
+	lineDelta := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}`)
+	buffer.ObserveClaudeStream(lineDelta)
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffer to contain usage detail")
+	}
+	if detail.InputTokens != 2095 {
+		t.Errorf("InputTokens = %d, want 2095", detail.InputTokens)
+	}
+	if detail.OutputTokens != 15 {
+		t.Errorf("OutputTokens = %d, want 15", detail.OutputTokens)
+	}
+	if detail.CacheReadTokens != 355598 {
+		t.Errorf("CacheReadTokens = %d, want 355598", detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 7185 {
+		t.Errorf("CacheCreationTokens = %d, want 7185", detail.CacheCreationTokens)
+	}
+	if detail.CachedTokens != 355598 {
+		t.Errorf("CachedTokens = %d, want 355598", detail.CachedTokens)
+	}
+	wantTotal := int64(2095 + 15 + 355598 + 7185)
+	if detail.TotalTokens != wantTotal {
+		t.Errorf("TotalTokens = %d, want %d", detail.TotalTokens, wantTotal)
+	}
+}
+
+func TestStreamUsageBufferObserveClaudeStream_FailurePreservesUsage(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	lineStart := []byte(`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-opus-5","usage":{"input_tokens":2095,"cache_creation_input_tokens":7185,"cache_read_input_tokens":355598,"output_tokens":1}}}`)
+	buffer.ObserveClaudeStream(lineStart)
+
+	reporter := &UsageReporter{
+		provider: "claude",
+		model:    "claude-opus-5",
+	}
+
+	record := reporter.buildRecord(buffer.detail, true, failFromErrors(context.Canceled))
+	if !record.Failed {
+		t.Fatal("expected record to be marked failed")
+	}
+	if record.Detail.InputTokens != 2095 {
+		t.Errorf("InputTokens = %d, want 2095", record.Detail.InputTokens)
+	}
+	if record.Detail.CacheReadTokens != 355598 {
+		t.Errorf("CacheReadTokens = %d, want 355598", record.Detail.CacheReadTokens)
+	}
+	if record.Detail.CacheCreationTokens != 7185 {
+		t.Errorf("CacheCreationTokens = %d, want 7185", record.Detail.CacheCreationTokens)
+	}
+
+	// Verify buffer.PublishFailure succeeds with the accumulated usage detail
+	if !buffer.PublishFailure(context.Background(), reporter, context.Canceled) {
+		t.Fatal("expected PublishFailure to return true")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -523,4 +1093,178 @@ type TestUsageExecutor struct{}
 
 func (TestUsageExecutor) Identifier() string {
 	return "test-provider"
+}
+
+func TestUsageReporterPropagatesSessionHierarchy(t *testing.T) {
+	ctx := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "claude:sess-1:agent:sub-1",
+		ParentSessionID: "claude:sess-1",
+	})
+
+	reporter := NewUsageReporter(ctx, "claude", "claude-3-7-sonnet", nil)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record.SessionID != "claude:sess-1:agent:sub-1" || record.ParentSessionID != "claude:sess-1" {
+		t.Fatalf("record session hierarchy = (%q, %q), want (claude:sess-1:agent:sub-1, claude:sess-1)", record.SessionID, record.ParentSessionID)
+	}
+
+	// Test explicit override via SetSessionHierarchy
+	reporter.SetSessionHierarchy("override:child", "override:parent")
+	record2 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record2.SessionID != "override:child" || record2.ParentSessionID != "override:parent" {
+		t.Fatalf("overridden record session hierarchy = (%q, %q), want (override:child, override:parent)", record2.SessionID, record2.ParentSessionID)
+	}
+
+	// Test self-loop elimination in SetSessionHierarchy
+	reporter.SetSessionHierarchy("loop:node", "loop:node")
+	record3 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record3.SessionID != "loop:node" || record3.ParentSessionID != "" {
+		t.Fatalf("self loop record session hierarchy = (%q, %q), want (loop:node, empty)", record3.SessionID, record3.ParentSessionID)
+	}
+
+	// Test orphan parent elimination when sessionID is empty
+	reporter.SetSessionHierarchy("", "orphan:parent")
+	record4 := reporter.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if record4.SessionID != "" || record4.ParentSessionID != "" {
+		t.Fatalf("orphan parent record session hierarchy = (%q, %q), want empty both", record4.SessionID, record4.ParentSessionID)
+	}
+
+	// Test cross-prefix alias rejection (e.g. pck:* and conv:* are aliases, not parent-child)
+	ctxAlias := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "pck:prompt-key-123",
+		ParentSessionID: "conv:conv-456",
+	})
+	reporterAlias := NewUsageReporter(ctxAlias, "openai", "gpt-5.4", nil)
+	recordAlias := reporterAlias.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if recordAlias.SessionID != "pck:prompt-key-123" || recordAlias.ParentSessionID != "" {
+		t.Fatalf("cross prefix alias emitted as parent: (%q, %q), want (pck:prompt-key-123, empty)", recordAlias.SessionID, recordAlias.ParentSessionID)
+	}
+
+	reporterAlias.SetSessionHierarchy("pck:key-999", "conv:alias-888")
+	recordAlias2 := reporterAlias.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
+	if recordAlias2.SessionID != "pck:key-999" || recordAlias2.ParentSessionID != "" {
+		t.Fatalf("SetSessionHierarchy cross prefix alias emitted as parent: (%q, %q), want (pck:key-999, empty)", recordAlias2.SessionID, recordAlias2.ParentSessionID)
+	}
+}
+
+func TestUsageReporterPropagatesBaseURL(t *testing.T) {
+	ctx := context.Background()
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-base-url-test",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "test-api-key",
+			"base_url": "https://custom.endpoint.example.com/v1",
+		},
+	}
+	reporter := NewUsageReporter(ctx, "codex", "gpt-5.6-luna", auth)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if record.BaseURL != "https://custom.endpoint.example.com/v1" {
+		t.Fatalf("record.BaseURL = %q, want %q", record.BaseURL, "https://custom.endpoint.example.com/v1")
+	}
+
+	authMeta := &cliproxyauth.Auth{
+		ID:       "auth-meta-base-url-test",
+		Provider: "openai",
+		Metadata: map[string]any{
+			"base_url": "https://meta.endpoint.example.com/v1",
+		},
+	}
+	reporterMeta := NewUsageReporter(ctx, "openai", "gpt-5.4", authMeta)
+	recordMeta := reporterMeta.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordMeta.BaseURL != "https://meta.endpoint.example.com/v1" {
+		t.Fatalf("recordMeta.BaseURL = %q, want %q", recordMeta.BaseURL, "https://meta.endpoint.example.com/v1")
+	}
+
+	// Attribute precedence over metadata
+	authBoth := &cliproxyauth.Auth{
+		ID:       "auth-both-test",
+		Provider: "openai",
+		Attributes: map[string]string{
+			"base_url": "https://attr.example.com",
+		},
+		Metadata: map[string]any{
+			"base_url": "https://meta.example.com",
+		},
+	}
+	reporterBoth := NewUsageReporter(ctx, "openai", "gpt-5.4", authBoth)
+	recordBoth := reporterBoth.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordBoth.BaseURL != "https://attr.example.com" {
+		t.Fatalf("recordBoth.BaseURL = %q, want %q", recordBoth.BaseURL, "https://attr.example.com")
+	}
+
+	// Blank attribute falls back to metadata
+	authBlankAttr := &cliproxyauth.Auth{
+		ID:       "auth-blank-test",
+		Provider: "openai",
+		Attributes: map[string]string{
+			"base_url": "   ",
+		},
+		Metadata: map[string]any{
+			"base_url": "https://meta.example.com",
+		},
+	}
+	reporterBlankAttr := NewUsageReporter(ctx, "openai", "gpt-5.4", authBlankAttr)
+	recordBlankAttr := reporterBlankAttr.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordBlankAttr.BaseURL != "https://meta.example.com" {
+		t.Fatalf("recordBlankAttr.BaseURL = %q, want %q", recordBlankAttr.BaseURL, "https://meta.example.com")
+	}
+
+	// Nil auth or unconfigured auth leaves BaseURL empty
+	reporterNilAuth := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	recordNilAuth := reporterNilAuth.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordNilAuth.BaseURL != "" {
+		t.Fatalf("recordNilAuth.BaseURL = %q, want empty", recordNilAuth.BaseURL)
+	}
+}
+
+func TestUsageReporter_AllocatesUniqueUUIDPerAttemptWithSharedTraceID(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "00000042")
+
+	// First execution attempt
+	reporter1 := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	record1 := reporter1.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+
+	// Second execution attempt (retry)
+	reporter2 := NewUsageReporter(ctx, "claude", "claude-3-7-sonnet", nil)
+	record2 := reporter2.buildRecord(usage.Detail{TotalTokens: 20}, false, usage.Failure{})
+
+	if record1.TraceID != "00000042" {
+		t.Fatalf("record1.TraceID = %q, want 00000042", record1.TraceID)
+	}
+	if record2.TraceID != "00000042" {
+		t.Fatalf("record2.TraceID = %q, want 00000042", record2.TraceID)
+	}
+
+	if record1.RequestID == "" {
+		t.Fatal("record1.RequestID should not be empty")
+	}
+	if record2.RequestID == "" {
+		t.Fatal("record2.RequestID should not be empty")
+	}
+
+	if record1.RequestID == record2.RequestID {
+		t.Fatalf("consecutive attempts must have distinct UUID RequestIDs: got %q and %q", record1.RequestID, record2.RequestID)
+	}
+
+	// Verify UUID format and version 4
+	u1, err1 := uuid.Parse(record1.RequestID)
+	if err1 != nil || u1.Version() != 4 {
+		t.Fatalf("record1.RequestID %q is not valid UUID v4: %v", record1.RequestID, err1)
+	}
+	u2, err2 := uuid.Parse(record2.RequestID)
+	if err2 != nil || u2.Version() != 4 {
+		t.Fatalf("record2.RequestID %q is not valid UUID v4: %v", record2.RequestID, err2)
+	}
+}
+
+func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "log-id-1")
+	ctx = usage.WithTraceID(ctx, "explicit-trace-1")
+
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+
+	if record.TraceID != "explicit-trace-1" {
+		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
+	}
 }
